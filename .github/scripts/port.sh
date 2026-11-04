@@ -84,7 +84,7 @@ endlog
 
 # ---------- 5. патчи ----------
 log "patches"
-sudo env BASE_ROOT="$BASE_ROOT" STAGE_ROOT="$STAGE_ROOT" REPO="$REPO" bash "$REPO/patches/apply.sh"
+sudo env BASE_ROOT="$BASE_ROOT" STAGE_ROOT="$STAGE_ROOT" REPO="$REPO" bash "$REPO/.github/scripts/apply.sh"
 endlog
 
 # ---------- 6. собрать новый system.img ----------
