@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 # ============================================================
 # Redmi 9C NFC - Xiaomi.eu MIUI 11 / Android 10 PORT
@@ -21,6 +20,7 @@
 #   - XML registration cleanup
 #   - Qualcomm init service block cleanup
 #   - Optional remove lists and overlays
+#   - ELF dependency audit (report only)
 #
 # IMPORTANT:
 #   This is a first-pass porting patch, not a guarantee of
@@ -171,8 +171,6 @@ for src, dst, label in pairs:
     copied = 0
 
     for current, dirs, files in os.walk(src):
-        rel_dir = os.path.relpath(current, src)
-
         dirs[:] = [
             d for d in dirs
             if not os.path.islink(os.path.join(current, d))
@@ -427,6 +425,10 @@ PY
 
 section "7. QUALCOMM INIT SERVICE CLEANUP"
 
+# service / import blocks that mention Qualcomm are removed whole.
+# "on" action blocks: only the offending lines are removed, so other
+# commands in the same block are kept (unless the trigger itself is Qualcomm).
+
 python3 - "$S" "$PS" <<'PY'
 import os
 import re
@@ -442,6 +444,70 @@ qcom = re.compile(
     re.IGNORECASE
 )
 
+HEADERS = ("service ", "on ", "import ")
+
+
+def clean_rc(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+
+    out = []
+    block = []
+    kind = None
+    changed = False
+
+    def flush():
+        nonlocal block, kind, changed
+        if not block:
+            return
+
+        if kind == "action" and not qcom.search(block[0]):
+            kept = [block[0]]
+            for x in block[1:]:
+                s = x.strip()
+                if s and not s.startswith("#") and qcom.search(x):
+                    changed = True
+                    print(f"[INIT REMOVE LINE] {path}: {s}")
+                else:
+                    kept.append(x)
+            out.extend(kept)
+        elif any(qcom.search(x) for x in block):
+            changed = True
+            print(f"[INIT REMOVE {kind.upper()}] {path}: {block[0].strip()}")
+        else:
+            out.extend(block)
+
+        block = []
+        kind = None
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith(HEADERS):
+            flush()
+            block = [line]
+            if stripped.startswith("service "):
+                kind = "service"
+            elif stripped.startswith("on "):
+                kind = "action"
+            else:
+                kind = "import"
+        elif block and (line[:1].isspace() or not stripped or stripped.startswith("#")):
+            block.append(line)
+        else:
+            flush()
+            out.append(line)
+
+    flush()
+
+    if changed:
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(out)
+
+
 for label, root in roots:
     print(f"\n[INIT CLEAN] {label}")
 
@@ -451,78 +517,8 @@ for label, root in roots:
 
     for current, dirs, files in os.walk(root):
         for name in files:
-            if not name.endswith(".rc"):
-                continue
-
-            path = os.path.join(current, name)
-
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    lines = f.readlines()
-            except OSError:
-                continue
-
-            output = []
-            block = []
-            block_type = None
-            changed = False
-
-            def flush():
-                nonlocal_dummy = None
-                return
-
-            for line in lines:
-                stripped = line.strip()
-
-                is_header = (
-                    stripped.startswith("service ") or
-                    stripped.startswith("on ") or
-                    stripped.startswith("import ")
-                )
-
-                if is_header:
-                    if block:
-                        if block_type == "import":
-                            if not any(qcom.search(x) for x in block):
-                                output.extend(block)
-                            else:
-                                changed = True
-                                print(f"[INIT REMOVE IMPORT] {path}")
-                        elif not any(qcom.search(x) for x in block):
-                            output.extend(block)
-                        else:
-                            changed = True
-                            print(f"[INIT REMOVE BLOCK] {path}")
-
-                    block = [line]
-                    if stripped.startswith("service "):
-                        block_type = "service"
-                    elif stripped.startswith("on "):
-                        block_type = "action"
-                    else:
-                        block_type = "import"
-                else:
-                    if block:
-                        # Indented lines belong to current service/action.
-                        if line[:1].isspace() or not stripped:
-                            block.append(line)
-                        else:
-                            output.extend(block)
-                            block = [line]
-                            block_type = "other"
-                    else:
-                        output.append(line)
-
-            if block:
-                if any(qcom.search(x) for x in block):
-                    changed = True
-                    print(f"[INIT REMOVE BLOCK] {path}")
-                else:
-                    output.extend(block)
-
-            if changed:
-                with open(path, "w", encoding="utf-8") as f:
-                    f.writelines(output)
+            if name.endswith(".rc"):
+                clean_rc(os.path.join(current, name))
 PY
 
 # ---------- 8. XML registration cleanup ----------
@@ -688,6 +684,7 @@ section "10. FSTAB"
 
 python3 - "$B" "$S" "$BP" "$PS" <<'PY'
 import os
+import sys
 import shutil
 
 pairs = [
@@ -793,6 +790,82 @@ else
   echo "[SKIP] no product overlay"
 fi
 
+# ---------- 12a. ELF dependency audit (report only) ----------
+
+section "12a. ELF DEPENDENCY AUDIT (QUALCOMM)"
+
+# After cleanup, report every remaining ELF that still links against a
+# Qualcomm library which no longer exists anywhere (stage system/product or
+# stock vendor). Nothing is changed here, this is only a report.
+# A missing DT_NEEDED library can stop a native service or system_server.
+
+python3 - "$S" "$PS" "$BV" <<'PY'
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+if shutil.which("readelf") is None:
+    print("[ELF AUDIT] readelf not found, audit skipped")
+    sys.exit(0)
+
+qcom = re.compile(
+    r"(qualcomm|com\.qti|vendor\.qti|vendor\.qcom|libqti|libqcril|libqmi|qcril|qsee|qtee|qdsp|qcom)",
+    re.IGNORECASE
+)
+
+stage_roots = [r for r in sys.argv[1:3] if r and os.path.isdir(r)]
+have_roots = [r for r in sys.argv[1:4] if r and os.path.isdir(r)]
+
+have = set()
+for root in have_roots:
+    for current, dirs, files in os.walk(root):
+        for name in files:
+            if name.endswith(".so") or ".so." in name:
+                have.add(name)
+
+missing = {}
+
+for root in stage_roots:
+    for current, dirs, files in os.walk(root):
+        for name in files:
+            path = os.path.join(current, name)
+
+            if os.path.islink(path):
+                continue
+
+            try:
+                with open(path, "rb") as fh:
+                    if fh.read(4) != b"\x7fELF":
+                        continue
+            except OSError:
+                continue
+
+            out = subprocess.run(
+                ["readelf", "-d", path],
+                capture_output=True,
+                text=True
+            ).stdout
+
+            for m in re.finditer(r"Shared library: \[([^\]]+)\]", out):
+                need = m.group(1)
+                if qcom.search(need) and need not in have:
+                    rel = os.path.relpath(path, root).replace("\\", "/")
+                    missing.setdefault(need, []).append(rel)
+
+print(f"[ELF AUDIT] missing Qualcomm libraries still referenced: {len(missing)}")
+
+for need in sorted(missing):
+    users = missing[need]
+    shown = ", ".join(users[:5])
+    more = f" (+{len(users) - 5} more)" if len(users) > 5 else ""
+    print(f"[BROKEN DEP] {need} <- {shown}{more}")
+
+if not missing:
+    print("[ELF AUDIT] OK: no broken Qualcomm dependencies found")
+PY
+
 # ---------- 13. final inventory ----------
 
 section "13. FINAL INVENTORY"
@@ -840,11 +913,13 @@ echo "  - Stock framework compatibility matrices"
 echo "  - Stock product VINTF when available"
 echo "  - MTK/IMS init import"
 echo "  - Conservative Qualcomm cleanup"
+echo "  - Qualcomm init cleanup (services whole, action blocks by line)"
 echo "  - Qualcomm XML registration cleanup"
 echo "  - Qualcomm public library registration cleanup"
 echo "  - Stock fstab files copied when present"
 echo "  - remove.txt / product-remove.txt"
 echo "  - system/product overlays"
+echo "  - ELF dependency audit (report only)"
 
 echo
 echo "Not modified:"
