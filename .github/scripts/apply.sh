@@ -5,6 +5,8 @@ set -euo pipefail
 
 B="$BASE_ROOT"
 S="$STAGE_ROOT"
+echo "== AUDIT: топ по размеру =="
+du -sm "$S"/app/* "$S"/priv-app/* "$S"/data-app/* "$S"/media "$S"/fonts 2>/dev/null | sort -n | tail -50 || true
 
 echo "== 1. Идентичность устройства из базы 9C =="
 for k in \
