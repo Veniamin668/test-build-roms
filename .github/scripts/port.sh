@@ -93,10 +93,10 @@ endlog
 log "build system image"
 used=$(sudo du -sb stage | cut -f1)
 # +15% и +200 МБ запас, выравнивание по 4096
-size=$(( (used * 103 / 100 + 180 * 1024 * 1024) / 4096 * 4096 ))
+size=$(( (used * 102 / 100 + 48 * 1024 * 1024) / 4096 * 4096 ))
 echo "used=$used size=$size"
 truncate -s "$size" system_new.img
-sudo mke2fs -q -t ext4 -b 4096 -i 8192 -m 0 -L system -O ^has_journal -d stage system_new.img
+sudo mke2fs -q -t ext4 -b 4096 -N 20000 -m 0 -L system -O ^has_journal -d stage system_new.img
 sudo e2fsck -fn system_new.img || true
 
 sudo umount mnt_base mnt_donor
