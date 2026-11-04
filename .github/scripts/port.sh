@@ -38,6 +38,8 @@ endlog
 log "tools"
 git clone --depth 1 https://github.com/xpirt/sdat2img.git
 git clone --depth 1 https://github.com/xpirt/img2sdat.git
+sed -i 's/^import imp$/import importlib/' img2sdat/*.py
+grep -n "imp\." img2sdat/*.py || true
 endlog
 
 # распаковка раздела: .new.dat.br -> .new.dat -> .img (raw ext4)
