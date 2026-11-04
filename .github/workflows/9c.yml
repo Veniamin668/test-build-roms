@@ -34,7 +34,7 @@ jobs:
         env:
           BASE_URL: ${{ inputs.base_url }}
           DONOR_URL: ${{ inputs.donor_url }}
-        run: bash scripts/port.sh
+        run: bash .github/scripts/port.sh
 
       - name: Upload result
         uses: actions/upload-artifact@v4
@@ -44,6 +44,16 @@ jobs:
           compression-level: 0
           retention-days: 3
 
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "port-${{ github.run_number }}" out/*.zip \
+            --repo "${{ github.repository }}" \
+            --title "MIUI 11 port #${{ github.run_number }}" \
+            --notes "Base: 12.0.16.0 NFC Global" \
+            --prerelease
+            
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
