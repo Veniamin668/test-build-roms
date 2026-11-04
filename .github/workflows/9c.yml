@@ -7,6 +7,7 @@ on:
         description: "Прямая ссылка на донор (xiaomi.eu recovery zip, MIUI 11 / Android 10)"
         required: true
         type: string
+        default: "https://ava1.androidfilehost.com/dl/TgNlK3wrl3F_2ogT4HExlQ/1793799072/8889791610682876434/xiaomi.eu_multi_HM7_V11.0.1.0.QFLCNXM_v11-10.zip"
       base_url:
         description: "База 9C (recovery zip, Android 10, vendor 29)"
         required: false
