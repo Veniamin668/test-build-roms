@@ -15,6 +15,9 @@ set -euo pipefail
 # Ник мейнтейнера для баннера в рекавери
 MAINT="${MAINT:-Veniamin668}"
 
+# Лимит GitHub на один файл в релизе: 2 GiB
+RELEASE_LIMIT=$((2 * 1024 * 1024 * 1024))
+
 REPO="$PWD"
 W="$REPO/work"
 OUT="$REPO/out"
@@ -186,16 +189,11 @@ endlog
 
 # ---------- 5a. раскладка разделов (диагностика, ничего не меняет) ----------
 log "layout check"
-echo "--- корень образа донора (stage):"
-sudo ls -la stage | head -40
-echo "--- каталог system донора:"
-sudo ls -la "$STAGE_ROOT" | head -60
 echo "--- product / vendor / odm у донора (ссылка или каталог):"
 for p in "$W/stage/product" "$W/stage/vendor" "$W/stage/odm" "$STAGE_ROOT/product" "$STAGE_ROOT/vendor"; do
   sudo ls -ld "$p" 2>&1 || true
 done
-echo "--- корень образа базы (mnt_base):"
-sudo ls -la mnt_base | head -40
+echo "--- product / vendor / odm у базы:"
 for p in "$W/mnt_base/product" "$W/mnt_base/vendor" "$BASE_ROOT/product" "$BASE_ROOT/vendor"; do
   sudo ls -ld "$p" 2>&1 || true
 done
@@ -217,17 +215,30 @@ sudo env \
 endlog
 
 # ---------- 7. изменился ли product ----------
+# --no-dereference: симлинки сравниваются как симлинки. Без него diff
+# спотыкается о битые ссылки (например app/FM/lib/arm/libfmjni.so)
+# и сообщает об изменении там, где ничего не менялось.
 log "product change check"
 PRODUCT_CHANGED=0
 if [ "$HAVE_DONOR_PRODUCT" = 1 ]; then
   PRODUCT_CHANGED=1
   info "product донора, перепаковка обязательна"
-elif sudo diff -rq mnt_base_product stage_product > product.diff 2>&1; then
-  info "product не изменился, остаётся стоковый образ"
 else
-  PRODUCT_CHANGED=1
-  warn "apply.sh изменил product, он будет перепакован"
-  head -n 40 product.diff || true
+  set +e
+  sudo diff -rq --no-dereference mnt_base_product stage_product > product.diff 2>&1
+  DIFF_RC=$?
+  set -e
+  if [ "$DIFF_RC" = 0 ]; then
+    info "product не изменился, остаётся стоковый образ"
+  elif [ "$DIFF_RC" = 1 ]; then
+    PRODUCT_CHANGED=1
+    warn "apply.sh изменил product, он будет перепакован"
+    head -n 40 product.diff || true
+  else
+    PRODUCT_CHANGED=1
+    warn "diff завершился с ошибкой ($DIFF_RC), product считаю изменённым"
+    head -n 40 product.diff || true
+  fi
 fi
 endlog
 
@@ -375,8 +386,15 @@ endlog
 # ---------- 12. упаковка ----------
 log "zip"
 ( cd pkg && zip -r -1 -q "$OUT/MIUI11-angelican-port.zip" . )
-ls -lh "$OUT"
-ok "zip собран"
+ZIP="$OUT/MIUI11-angelican-port.zip"
+ZIP_SIZE=$(stat -c %s "$ZIP")
+ls -l "$ZIP"
+ok "zip собран, ${ZIP_SIZE} байт ($(numfmt --to=iec-i --suffix=B "$ZIP_SIZE"))"
+if [ "$ZIP_SIZE" -ge "$RELEASE_LIMIT" ]; then
+  warn "zip больше 2 GiB: шаг Publish release упадёт (лимит GitHub на файл в релизе). Файл останется в артефактах. Уменьши system/product или раздели архив"
+elif [ "$ZIP_SIZE" -ge $((RELEASE_LIMIT - 100 * 1024 * 1024)) ]; then
+  warn "zip в пределах 100 MiB от лимита релиза (2 GiB)"
+fi
 endlog
 
 # ---------- сводка для страницы запуска ----------
@@ -390,8 +408,9 @@ endlog
   else
     echo "| product | сток |"
   fi
-  echo "| zip | $(du -h "$OUT"/MIUI11-angelican-port.zip | cut -f1) |"
-  echo "| sha256 | $(sha256sum "$OUT"/MIUI11-angelican-port.zip | cut -d' ' -f1) |"
+  echo "| zip | $(numfmt --to=iec-i --suffix=B "$ZIP_SIZE") ($ZIP_SIZE байт) |"
+  echo "| лимит релиза 2 GiB | $([ "$ZIP_SIZE" -lt "$RELEASE_LIMIT" ] && echo 'проходит' || echo 'ПРЕВЫШЕН') |"
+  echo "| sha256 | $(sha256sum "$ZIP" | cut -d' ' -f1) |"
 } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 ok "DONE"
