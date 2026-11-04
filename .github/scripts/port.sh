@@ -93,7 +93,7 @@ endlog
 log "build system image"
 used=$(sudo du -sb stage | cut -f1)
 # +15% и +200 МБ запас, выравнивание по 4096
-size=$(( (used * 115 / 100 + 200 * 1024 * 1024) / 4096 * 4096 ))
+size=$(( (used * 103 / 100 + 180 * 1024 * 1024) / 4096 * 4096 ))
 echo "used=$used size=$size"
 truncate -s "$size" system_new.img
 sudo mke2fs -q -t ext4 -b 4096 -i 8192 -m 0 -L system -O ^has_journal -d stage system_new.img
@@ -105,7 +105,8 @@ endlog
 # ---------- 7. img -> dat.br ----------
 log "img2sdat"
 mkdir -p dat
-python3 img2sdat/img2sdat.py system_new.img -o dat -v 4 -p system
+img2simg system_new.img system_new.sparse.img
+python3 img2sdat/img2sdat.py system_new.sparse.img -o dat -v 4 -p system
 brotli -f -q 6 dat/system.new.dat -o dat/system.new.dat.br
 ls -lh dat
 endlog
