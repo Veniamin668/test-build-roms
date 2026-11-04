@@ -145,7 +145,7 @@ if unpack_opt donor product; then
   HAVE_DONOR_PRODUCT=1
   ok "у донора есть свой product"
 else
-  info "у донора нет product, будет использован сток 9C"
+  info "у донора нет отдельного product, будет использован сток 9C"
 fi
 rm -f base/*.new.dat.br donor/*.new.dat.br
 file base/system.img base/product.img base/vendor.img donor/system.img || true
@@ -182,6 +182,25 @@ echo "BASE_PRODUCT_ROOT=$BASE_PRODUCT_ROOT"
 echo "DONOR_PRODUCT_ROOT=${DONOR_PRODUCT_ROOT:-<нет>}"
 echo "STAGE_PRODUCT_ROOT=$STAGE_PRODUCT_ROOT"
 echo "BASE_VENDOR_ROOT=$BASE_VENDOR_ROOT"
+endlog
+
+# ---------- 5a. раскладка разделов (диагностика, ничего не меняет) ----------
+log "layout check"
+echo "--- корень образа донора (stage):"
+sudo ls -la stage | head -40
+echo "--- каталог system донора:"
+sudo ls -la "$STAGE_ROOT" | head -60
+echo "--- product / vendor / odm у донора (ссылка или каталог):"
+for p in "$W/stage/product" "$W/stage/vendor" "$W/stage/odm" "$STAGE_ROOT/product" "$STAGE_ROOT/vendor"; do
+  sudo ls -ld "$p" 2>&1 || true
+done
+echo "--- корень образа базы (mnt_base):"
+sudo ls -la mnt_base | head -40
+for p in "$W/mnt_base/product" "$W/mnt_base/vendor" "$BASE_ROOT/product" "$BASE_ROOT/vendor"; do
+  sudo ls -ld "$p" 2>&1 || true
+done
+echo "--- самые большие каталоги внутри system донора (МБ):"
+sudo du -sm "$STAGE_ROOT"/* 2>/dev/null | sort -n | tail -15 || true
 endlog
 
 # ---------- 6. патчи ----------
