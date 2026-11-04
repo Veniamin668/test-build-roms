@@ -1,0 +1,53 @@
+name: Port MIUI 11 -> Redmi 9C NFC (angelican)
+
+on:
+  workflow_dispatch:
+    inputs:
+      donor_url:
+        description: "Прямая ссылка на донор (xiaomi.eu recovery zip, MIUI 11 / Android 10)"
+        required: true
+        type: string
+      base_url:
+        description: "База 9C (recovery zip, Android 10, vendor 29)"
+        required: false
+        type: string
+        default: "https://bn.d.miui.com/V12.0.16.0.QCSMIXM/miui_ANGELICANGlobal_V12.0.16.0.QCSMIXM_aa62ece321_10.0.zip"
+
+jobs:
+  port:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y brotli rsync zip unzip e2fsprogs python3 attr
+
+      - name: Port
+        env:
+          BASE_URL: ${{ inputs.base_url }}
+          DONOR_URL: ${{ inputs.donor_url }}
+        run: bash scripts/port.sh
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: miui11-angelican-port
+          path: out/*.zip
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: port-logs
+          path: work/*.log
+          if-no-files-found: ignore
