@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Port MIUI 11 (донор, Android 10) -> Redmi 9C NFC (angelican)
 #
-#   system  : донор (Xiaomi.eu MIUI 11), патчится apply.sh
-#   product : сток 9C; если у донора есть свой product, берётся он. Перепаковывается только если apply.sh что-то в нём изменил
-#   vendor  : сток 9C без изменений (монтируется только для чтения, для apply.sh)
+#   system  : донор (Xiaomi.eu MIUI 11), патчится apply.sh. Product лежит ВНУТРИ
+#             system (/system/product), отдельного раздела product нет
+#   product : в пакет не входит. Сток 9C монтируется только для чтения,
+#             как источник MTK-файлов для apply.sh
+#   vendor  : сток 9C без изменений (монтируется только для чтения)
 #   boot, dtbo, прошивки: из базы, поверх них подменяются файлы из папки firmware/
 #
 # Переменные окружения: BASE_URL, DONOR_URL (обязательно), MAINT (необязательно)
@@ -51,16 +53,6 @@ unpack() {
     ls -la "$d"
     exit 1
   fi
-}
-
-# то же, но если раздела нет, просто возвращает 1
-unpack_opt() {
-  local d="$1" n="$2"
-  if [ -f "$d/$n.new.dat.br" ] || [ -f "$d/$n.new.dat" ] || [ -f "$d/$n.img" ]; then
-    unpack "$d" "$n"
-    return 0
-  fi
-  return 1
 }
 
 # корень system: у system-as-root образа лежит в <mnt>/system, иначе прямо в <mnt>
@@ -143,12 +135,8 @@ unpack base system
 unpack base product
 unpack base vendor
 unpack donor system
-HAVE_DONOR_PRODUCT=0
-if unpack_opt donor product; then
-  HAVE_DONOR_PRODUCT=1
-  ok "у донора есть свой product"
-else
-  info "у донора нет отдельного product, будет использован сток 9C"
+if [ -f donor/product.new.dat.br ] || [ -f donor/product.new.dat ] || [ -f donor/product.img ]; then
+  warn "у донора есть отдельный product: он игнорируется, product в этой схеме не прошивается"
 fi
 rm -f base/*.new.dat.br donor/*.new.dat.br
 file base/system.img base/product.img base/vendor.img donor/system.img || true
@@ -157,7 +145,7 @@ endlog
 
 # ---------- 5. смонтировать и подготовить staging ----------
 log "mount + stage"
-mkdir -p stage stage_product
+mkdir -p stage
 mount_ro base/system.img  mnt_base
 mount_ro base/product.img mnt_base_product
 mount_ro base/vendor.img  mnt_base_vendor
@@ -165,40 +153,25 @@ mount_ro donor/system.img mnt_donor
 
 sudo rsync -aHAX mnt_donor/ stage/
 
-if [ "$HAVE_DONOR_PRODUCT" = 1 ]; then
-  mount_ro donor/product.img mnt_donor_product
-  sudo rsync -aHAX mnt_donor_product/ stage_product/
-  DONOR_PRODUCT_ROOT="$W/mnt_donor_product"
-else
-  sudo rsync -aHAX mnt_base_product/ stage_product/
-  DONOR_PRODUCT_ROOT=""
-fi
-
 BASE_ROOT="$(sysroot "$W/mnt_base")"
 STAGE_ROOT="$(sysroot "$W/stage")"
 BASE_PRODUCT_ROOT="$W/mnt_base_product"
-STAGE_PRODUCT_ROOT="$W/stage_product"
 BASE_VENDOR_ROOT="$W/mnt_base_vendor"
 echo "BASE_ROOT=$BASE_ROOT"
 echo "STAGE_ROOT=$STAGE_ROOT"
-echo "BASE_PRODUCT_ROOT=$BASE_PRODUCT_ROOT"
-echo "DONOR_PRODUCT_ROOT=${DONOR_PRODUCT_ROOT:-<нет>}"
-echo "STAGE_PRODUCT_ROOT=$STAGE_PRODUCT_ROOT"
+echo "BASE_PRODUCT_ROOT=$BASE_PRODUCT_ROOT (только чтение, не прошивается)"
 echo "BASE_VENDOR_ROOT=$BASE_VENDOR_ROOT"
+echo "--- /product в образе донора:"
+sudo ls -ld "$W/stage/product" "$STAGE_ROOT/product" 2>&1 || true
 endlog
 
-# ---------- 5a. раскладка разделов (диагностика, ничего не меняет) ----------
-log "layout check"
-echo "--- product / vendor / odm у донора (ссылка или каталог):"
-for p in "$W/stage/product" "$W/stage/vendor" "$W/stage/odm" "$STAGE_ROOT/product" "$STAGE_ROOT/vendor"; do
-  sudo ls -ld "$p" 2>&1 || true
-done
-echo "--- product / vendor / odm у базы:"
-for p in "$W/mnt_base/product" "$W/mnt_base/vendor" "$BASE_ROOT/product" "$BASE_ROOT/vendor"; do
-  sudo ls -ld "$p" 2>&1 || true
-done
-echo "--- самые большие каталоги внутри system донора (МБ):"
-sudo du -sm "$STAGE_ROOT"/* 2>/dev/null | sort -n | tail -15 || true
+# ---------- 5a. fstab базы: нужен ли product (диагностика, ничего не меняет) ----------
+# Сток-vendor может монтировать /product при загрузке. Если у записи product нет
+# nofail, а раздела в super не будет, раннее монтирование может не пройти.
+log "fstab check (vendor stock)"
+sudo sh -c 'for f in mnt_base_vendor/etc/fstab*; do [ -f "$f" ] || continue; echo "--- $f"; grep -v "^#" "$f" | grep -v "^[[:space:]]*$"; done' || true
+echo "--- записи с product / odm:"
+sudo sh -c 'grep -H -i -E "product|odm" mnt_base_vendor/etc/fstab* 2>/dev/null' || echo "(записей про product/odm в vendor/etc/fstab* нет)"
 endlog
 
 # ---------- 6. патчи ----------
@@ -207,50 +180,19 @@ sudo env \
   BASE_ROOT="$BASE_ROOT" \
   STAGE_ROOT="$STAGE_ROOT" \
   BASE_PRODUCT_ROOT="$BASE_PRODUCT_ROOT" \
-  DONOR_PRODUCT_ROOT="$DONOR_PRODUCT_ROOT" \
-  STAGE_PRODUCT_ROOT="$STAGE_PRODUCT_ROOT" \
   BASE_VENDOR_ROOT="$BASE_VENDOR_ROOT" \
   REPO="$REPO" \
   bash "$REPO/.github/scripts/apply.sh"
 endlog
 
-# ---------- 7. изменился ли product ----------
-# --no-dereference: симлинки сравниваются как симлинки. Без него diff
-# спотыкается о битые ссылки (например app/FM/lib/arm/libfmjni.so)
-# и сообщает об изменении там, где ничего не менялось.
-log "product change check"
-PRODUCT_CHANGED=0
-if [ "$HAVE_DONOR_PRODUCT" = 1 ]; then
-  PRODUCT_CHANGED=1
-  info "product донора, перепаковка обязательна"
-else
-  set +e
-  sudo diff -rq --no-dereference mnt_base_product stage_product > product.diff 2>&1
-  DIFF_RC=$?
-  set -e
-  if [ "$DIFF_RC" = 0 ]; then
-    info "product не изменился, остаётся стоковый образ"
-  elif [ "$DIFF_RC" = 1 ]; then
-    PRODUCT_CHANGED=1
-    warn "apply.sh изменил product, он будет перепакован"
-    head -n 40 product.diff || true
-  else
-    PRODUCT_CHANGED=1
-    warn "diff завершился с ошибкой ($DIFF_RC), product считаю изменённым"
-    head -n 40 product.diff || true
-  fi
-fi
-endlog
-
-# ---------- 8. размонтировать и освободить место ----------
+# ---------- 7. размонтировать и освободить место ----------
 log "umount"
 sudo umount mnt_base mnt_base_product mnt_base_vendor mnt_donor
-if [ "$HAVE_DONOR_PRODUCT" = 1 ]; then sudo umount mnt_donor_product; fi
 rm -f base/*.img donor/*.img
 df -h /
 endlog
 
-# ---------- 9. собрать system ----------
+# ---------- 8. собрать system ----------
 log "build system image"
 build_ext4 system stage system_new.img
 SYS_SIZE="$LAST_SIZE"
@@ -258,35 +200,52 @@ pack_dat system system_new.img
 ls -lh dat
 endlog
 
-# ---------- 10. собрать product (если менялся) ----------
-PROD_SIZE=0
-if [ "$PRODUCT_CHANGED" = 1 ]; then
-  log "build product image"
-  build_ext4 product stage_product product_new.img
-  PROD_SIZE="$LAST_SIZE"
-  pack_dat product product_new.img
-  ls -lh dat
-  endlog
-fi
-
-# ---------- 11. собрать пакет на основе базы ----------
+# ---------- 9. собрать пакет на основе базы ----------
 log "assemble package"
 unzip -q -o base.zip -d pkg
 cp dat/system.new.dat.br pkg/system.new.dat.br
 cp dat/system.transfer.list pkg/system.transfer.list
 cp dat/system.patch.dat pkg/system.patch.dat
 ok "system подставлен в пакет"
-if [ "$PRODUCT_CHANGED" = 1 ]; then
-  cp dat/product.new.dat.br pkg/product.new.dat.br
-  cp dat/product.transfer.list pkg/product.transfer.list
-  cp dat/product.patch.dat pkg/product.patch.dat
-  ok "product подставлен в пакет"
-else
-  info "product в пакете остаётся стоковым"
-fi
+
+# product не прошивается: убираем его из пакета, списка разделов и updater-script
+rm -f pkg/product.new.dat.br pkg/product.transfer.list pkg/product.patch.dat
+sed -i '/product/d' pkg/dynamic_partitions_op_list
+ok "product убран из пакета и из dynamic_partitions_op_list"
 endlog
 
-# ---------- 11a. подмена прошивок из папки firmware/ ----------
+# ---------- 9a. updater-script: убрать блок product ----------
+log "updater-script: remove product"
+US=pkg/META-INF/com/google/android/updater-script
+python3 - "$US" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path, encoding="utf-8", errors="replace").read()
+
+new = re.sub(
+    r'# Patch partition product\s*\n.*?Failed to update product image\."\);\s*\n',
+    '',
+    text,
+    count=1,
+    flags=re.S,
+)
+
+if new == text:
+    print("::warning::блок product в updater-script не найден, проверь скрипт вручную")
+else:
+    open(path, "w", encoding="utf-8").write(new)
+    print("блок product удалён из updater-script")
+
+left = [l for l in new.splitlines() if "product" in l.lower()]
+print(f"строк с 'product' осталось: {len(left)}")
+for l in left:
+    print("   ", l)
+PY
+endlog
+
+# ---------- 9b. подмена прошивок из папки firmware/ ----------
 log "firmware overrides"
 shopt -s nullglob
 if [ -d "$REPO/firmware" ]; then
@@ -313,9 +272,8 @@ fi
 shopt -u nullglob
 endlog
 
-# ---------- 11b. брендинг updater-script (баннер и мейнтейнер) ----------
+# ---------- 9c. брендинг updater-script (баннер и мейнтейнер) ----------
 log "updater-script branding"
-US=pkg/META-INF/com/google/android/updater-script
 BANNER=""
 for c in "$REPO/patches/banner.txt" "$REPO/.github/scripts/banner.txt"; do
   if [ -f "$c" ]; then BANNER="$c"; break; fi
@@ -346,12 +304,9 @@ echo "--- начало updater-script:"
 head -n 30 "$US"
 endlog
 
-# ---------- 11c. размеры разделов и проверка super ----------
+# ---------- 9d. размеры разделов и проверка super ----------
 log "dynamic partitions"
 sed -i -E "s/^(resize system )[0-9]+/\1${SYS_SIZE}/" pkg/dynamic_partitions_op_list
-if [ "$PRODUCT_CHANGED" = 1 ]; then
-  sed -i -E "s/^(resize product )[0-9]+/\1${PROD_SIZE}/" pkg/dynamic_partitions_op_list
-fi
 echo "--- dynamic_partitions_op_list:"
 cat pkg/dynamic_partitions_op_list
 
@@ -362,12 +317,12 @@ g = re.search(r'^add_group \S+ (\d+)', t, re.M)
 r = [int(x) for x in re.findall(r'^resize \S+ (\d+)', t, re.M)]
 print("group max:", g.group(1) if g else "n/a", "| sum of partitions:", sum(r))
 if g and sum(r) > int(g.group(1)):
-    sys.exit("ERROR: разделы не влезают в группу super. Уменьши system (чисти лишние приложения в patches/remove.txt)")
+    sys.exit("ERROR: разделы не влезают в группу super. Уменьши system (patches/remove.txt)")
 PY
 ok "разделы влезают в super"
 endlog
 
-# ---------- 11d. отключаем AVB-проверку во всех vbmeta ----------
+# ---------- 9e. отключаем AVB-проверку во всех vbmeta ----------
 log "vbmeta"
 # флаги big-endian по смещению 120..123
 python3 - pkg/vbmeta*.img <<'PY'
@@ -383,7 +338,7 @@ for p in sys.argv[1:]:
 PY
 endlog
 
-# ---------- 12. упаковка ----------
+# ---------- 10. упаковка ----------
 log "zip"
 ( cd pkg && zip -r -1 -q "$OUT/MIUI11-angelican-port.zip" . )
 ZIP="$OUT/MIUI11-angelican-port.zip"
@@ -391,7 +346,7 @@ ZIP_SIZE=$(stat -c %s "$ZIP")
 ls -l "$ZIP"
 ok "zip собран, ${ZIP_SIZE} байт ($(numfmt --to=iec-i --suffix=B "$ZIP_SIZE"))"
 if [ "$ZIP_SIZE" -ge "$RELEASE_LIMIT" ]; then
-  warn "zip больше 2 GiB: шаг Publish release упадёт (лимит GitHub на файл в релизе). Файл останется в артефактах. Уменьши system/product или раздели архив"
+  warn "zip больше 2 GiB: шаг Publish release упадёт (лимит GitHub на файл в релизе). Файл останется в артефактах"
 elif [ "$ZIP_SIZE" -ge $((RELEASE_LIMIT - 100 * 1024 * 1024)) ]; then
   warn "zip в пределах 100 MiB от лимита релиза (2 GiB)"
 fi
@@ -403,11 +358,7 @@ endlog
   echo "| параметр | значение |"
   echo "|---|---|"
   echo "| system | $(numfmt --to=iec "$SYS_SIZE") |"
-  if [ "$PRODUCT_CHANGED" = 1 ]; then
-    echo "| product | перепакован, $(numfmt --to=iec "$PROD_SIZE") |"
-  else
-    echo "| product | сток |"
-  fi
+  echo "| product | не прошивается (внутри system/product) |"
   echo "| zip | $(numfmt --to=iec-i --suffix=B "$ZIP_SIZE") ($ZIP_SIZE байт) |"
   echo "| лимит релиза 2 GiB | $([ "$ZIP_SIZE" -lt "$RELEASE_LIMIT" ] && echo 'проходит' || echo 'ПРЕВЫШЕН') |"
   echo "| sha256 | $(sha256sum "$ZIP" | cut -d' ' -f1) |"
