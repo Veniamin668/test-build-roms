@@ -2,32 +2,23 @@
 # ============================================================
 # Redmi 9C NFC - Xiaomi.eu MIUI 11 / Android 10 PORT
 #
-# Donor:
-#   system  -> Xiaomi.eu MIUI 11
-#   product -> Xiaomi.eu MIUI 11 (when available)
+# Layout of this port:
+#   system  -> Xiaomi.eu MIUI 11 donor (product lives INSIDE system/product,
+#              /product -> /system/product is kept, no product partition)
+#   vendor  -> Redmi 9C stock, untouched (mounted read-only here)
+#   stock system / stock product are used only as a source of MTK files
 #
-# Base:
-#   system  -> Redmi 9C stock
-#   product -> Redmi 9C stock
-#   vendor  -> Redmi 9C stock (kept unchanged)
-#
-# Adaptation:
-#   - Device identity
-#   - MTK IMS/framework files from stock
-#   - Stock product VINTF
-#   - Stock system compatibility matrix
-#   - Conservative Qualcomm cleanup
-#   - XML registration cleanup
-#   - Qualcomm init service block cleanup
-#   - Optional remove lists and overlays
-#   - Dependency cascade: whatever needs a removed library is removed,
-#     or restored from stock if it is a required component
-#   - Dangling references cleanup (init services, permission libraries)
-#   - ELF dependency audit (report only)
+# Policy of this version:
+#   - libraries are NOT deleted. If something needs a library that is
+#     missing, it is added from the stock system when stock has it
+#   - things that must not be touched are listed in KEEP_RE
+#     (default: qti.hardware.data, netmgrd; more in patches/keep.txt)
+#   - VINTF compatibility matrices: every <hal> becomes optional="true"
+#   - build.prop / prop.default are adapted to the 9C (identity, ABI,
+#     zygote, hardcoded hardware values, Qualcomm properties)
 #
 # IMPORTANT:
-#   This is a first-pass porting patch, not a guarantee of
-#   complete IMS compatibility. Review the generated logs.
+#   First-pass patch. Read the logs, they report what could not be solved.
 # ============================================================
 
 set -euo pipefail
@@ -39,13 +30,13 @@ S="${STAGE_ROOT:?STAGE_ROOT is required}"
 REPO="${REPO:?REPO is required}"
 
 BP="${BASE_PRODUCT_ROOT:-}"
-DP="${DONOR_PRODUCT_ROOT:-}"
-PS="${STAGE_PRODUCT_ROOT:-}"
 BV="${BASE_VENDOR_ROOT:-}"
 
-# names of libraries removed by this script, used by the dependency cascade
-REMOVED_LIST="$(mktemp)"
-export REMOVED_LIST
+# product is emulated inside system
+PS=""
+if [ -d "$S/product" ] && [ ! -L "$S/product" ]; then
+  PS="$S/product"
+fi
 
 echo "============================================================"
 echo " REDMI 9C / XIAOMI.EU MIUI 11 PORT PATCHER"
@@ -53,9 +44,8 @@ echo "============================================================"
 
 echo "[PATH] Stock system : $B"
 echo "[PATH] Donor system : $S"
-echo "[PATH] Stock product: ${BP:-unavailable}"
-echo "[PATH] Donor product: ${DP:-unavailable}"
-echo "[PATH] Stage product: ${PS:-unavailable}"
+echo "[PATH] Donor product: ${PS:-<нет, system/product отсутствует>} (inside system)"
+echo "[PATH] Stock product: ${BP:-unavailable} (reference only, not flashed)"
 echo "[PATH] Stock vendor : ${BV:-unavailable}"
 
 for d in "$B" "$S"; do
@@ -65,11 +55,20 @@ for d in "$B" "$S"; do
   fi
 done
 
-mkdir -p "$S"
+# ---------- keep list ----------
+# Anything matching KEEP_RE is never removed or rewritten.
+# Default follows the advice "do not touch qti hardware data".
 
-if [ -n "$PS" ]; then
-  mkdir -p "$PS"
+KEEP_RE='qti\.hardware\.data|netmgrd|\.data\.(connection|latency|dynamicdds|iwlan|qmi|cne)'
+if [ -f "$REPO/patches/keep.txt" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in ''|'#'*) continue ;; esac
+    KEEP_RE="$KEEP_RE|$line"
+  done < "$REPO/patches/keep.txt"
 fi
+export KEEP_RE
+echo "[KEEP] $KEEP_RE"
 
 # ---------- helpers ----------
 
@@ -80,51 +79,243 @@ section() {
   echo "============================================================"
 }
 
-available() {
-  [ -n "${1:-}" ] && [ -d "$1" ] && \
-    [ -n "$(find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
-}
+# ---------- 1. build.prop / prop.default ----------
 
-# ---------- 1. device identity ----------
+section "1. BUILD.PROP / PROP.DEFAULT ADAPTATION"
 
-section "1. DEVICE IDENTITY"
+# - identity, ABI, zygote, board and display density are taken from stock
+# - hardcoded hardware values of the donor (eMMC size, cutoff voltage,
+#   board platform, abilist64) are replaced by stock values or removed
+# - Qualcomm properties (qcom/qti/qualcomm/qcril/qmi, display/btstack/mm
+#   prefixes) are removed, or replaced by the stock value when stock has one
+# - everything matching KEEP_RE is left alone
 
-IDENTITY_KEYS=(
-  ro.product.system.device
-  ro.product.system.model
-  ro.product.system.name
-  ro.product.system.brand
-  ro.product.system.manufacturer
-  ro.product.device
-  ro.product.model
-  ro.product.name
-  ro.product.brand
-  ro.product.manufacturer
+python3 - "$B" "$S" <<'PY'
+import os
+import re
+import sys
+
+B, S = sys.argv[1], sys.argv[2]
+
+keep = re.compile(os.environ.get("KEEP_RE") or r"(?!)", re.IGNORECASE)
+
+IDENTITY = (
+    "ro.product.system.device", "ro.product.system.model", "ro.product.system.name",
+    "ro.product.system.brand", "ro.product.system.manufacturer",
+    "ro.product.device", "ro.product.model", "ro.product.name",
+    "ro.product.brand", "ro.product.manufacturer",
 )
 
-for k in "${IDENTITY_KEYS[@]}"; do
-  v="$(grep -m1 "^${k}=" "$B/build.prop" 2>/dev/null | cut -d= -f2- || true)"
+MIRROR = set(IDENTITY) | {
+    "ro.build.product", "ro.product.board",
+    "ro.zygote",
+    "ro.product.cpu.abi", "ro.product.cpu.abilist", "ro.product.cpu.abilist32",
+    "ro.sf.lcd_density",
+}
 
-  [ -n "$v" ] || continue
+DROP_UNLESS_STOCK = {
+    "ro.emmc_size", "ro.cutoff_voltage_mv",
+    "ro.product.cpu.abilist64", "ro.board.platform",
+}
 
-  if grep -q "^${k}=" "$S/build.prop"; then
-    sed -i "s|^${k}=.*|${k}=${v}|" "$S/build.prop"
-  else
-    printf '%s=%s\n' "$k" "$v" >> "$S/build.prop"
-  fi
+QCOM_KEY = re.compile(
+    r"^(ro\.qualcomm\.|ro\.vendor\.display\.|vendor\.display\.|"
+    r"persist\.vendor\.btstack\.|vendor\.mm\.)"
+)
+QCOM_ANY = re.compile(r"(qcom|qti|qualcomm|qcril|qmi)", re.IGNORECASE)
 
-  echo "[IDENTITY] $k=$v"
-done
 
-# ---------- 2. MTK framework / IMS import ----------
+def parse_line(line):
+    s = line.strip()
+    if not s or s.startswith("#") or "=" not in s:
+        return None
+    k, v = s.split("=", 1)
+    return k.strip(), v.strip()
 
-section "2. IMPORT MTK FRAMEWORK AND IMS FILES"
 
-# Copy only framework-side files from stock system/product.
+def load(path):
+    d = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                kv = parse_line(line)
+                if kv:
+                    d[kv[0]] = kv[1]
+    except OSError:
+        pass
+    return d
+
+
+stock = {}
+for rel in ("build.prop", "etc/prop.default"):
+    stock.update(load(os.path.join(B, rel)))
+
+print(f"[PROP] stock properties loaded: {len(stock)}")
+
+
+def mirrored(k):
+    return k in MIRROR or k.startswith("ro.hwui.")
+
+
+def process(rel, add_identity):
+    path = os.path.join(S, rel)
+    if not os.path.isfile(path):
+        print(f"[PROP] {rel}: not found, skipped")
+        return
+
+    with open(path, encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+
+    out = []
+    seen = set()
+    changes = 0
+
+    for line in lines:
+        kv = parse_line(line)
+        if not kv:
+            out.append(line)
+            continue
+
+        k, v = kv
+        seen.add(k)
+
+        if keep.search(k) or keep.search(v):
+            out.append(line)
+            continue
+
+        action, val = None, None
+
+        if mirrored(k) and k in stock:
+            if stock[k] != v:
+                action, val = "set", stock[k]
+        elif k in DROP_UNLESS_STOCK:
+            if k in stock:
+                if stock[k] != v:
+                    action, val = "set", stock[k]
+            else:
+                action = "del"
+        elif QCOM_KEY.search(k) or QCOM_ANY.search(k) or QCOM_ANY.search(v):
+            if k in stock and not QCOM_ANY.search(stock[k]):
+                if stock[k] != v:
+                    action, val = "set", stock[k]
+            else:
+                action = "del"
+
+        if action == "set":
+            print(f"[PROP] {rel}: {k}: {v} -> {val}")
+            out.append(f"{k}={val}\n")
+            changes += 1
+        elif action == "del":
+            print(f"[PROP] {rel}: remove {k}={v}")
+            changes += 1
+        else:
+            out.append(line)
+
+    if add_identity:
+        for k in IDENTITY:
+            if k in stock and k not in seen:
+                if out and not out[-1].endswith("\n"):
+                    out[-1] += "\n"
+                out.append(f"{k}={stock[k]}\n")
+                print(f"[PROP] {rel}: add {k}={stock[k]}")
+                changes += 1
+
+    if changes:
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(out)
+
+    print(f"[PROP] {rel}: {changes} change(s)")
+
+
+process("build.prop", True)
+process("etc/prop.default", False)
+PY
+
+# ---------- 2. ABI / bitness report ----------
+
+section "2. ABI REPORT (REPORT ONLY)"
+
+# The 9C stock userspace is expected to be 32-bit. This section shows what
+# the donor looks like and which donor apps ship only arm64 native libs
+# (such apps cannot run on a 32-bit-only runtime).
+
+python3 - "$S" "$B" <<'PY'
+import os
+import sys
+
+S, B = sys.argv[1], sys.argv[2]
+
+
+def image_root(p):
+    p = p.rstrip("/")
+    return os.path.dirname(p) if os.path.basename(p) == "system" else p
+
+
+def zygote_rc(root):
+    try:
+        return sorted(n for n in os.listdir(image_root(root)) if n.startswith("init.zygote"))
+    except OSError:
+        return []
+
+
+def prop(root, key):
+    for rel in ("etc/prop.default", "build.prop"):
+        try:
+            with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith(key + "="):
+                        return line.strip().split("=", 1)[1]
+        except OSError:
+            pass
+    return "<нет>"
+
+
+for label, root in (("stock", B), ("donor", S)):
+    has64 = "yes" if os.path.isdir(os.path.join(root, "lib64")) else "NO"
+    print(
+        f"[ABI] {label}: lib64={has64} zygote_rc={zygote_rc(root)} "
+        f"ro.zygote={prop(root, 'ro.zygote')} abilist={prop(root, 'ro.product.cpu.abilist')} "
+        f"abilist64={prop(root, 'ro.product.cpu.abilist64')}"
+    )
+
+only64 = []
+with32 = 0
+
+for sub in ("app", "priv-app", "product/app", "product/priv-app"):
+    base = os.path.join(S, sub)
+    if not os.path.isdir(base):
+        continue
+    for name in sorted(os.listdir(base)):
+        ld = os.path.join(base, name, "lib")
+        if not os.path.isdir(ld):
+            continue
+        subs = set(os.listdir(ld))
+        if "arm64" in subs and "arm" not in subs:
+            only64.append(f"{sub}/{name}")
+        elif "arm" in subs:
+            with32 += 1
+
+print(f"[ABI] donor apps with 32-bit native libs: {with32}")
+print(f"[ABI] donor apps with ONLY arm64 native libs: {len(only64)}")
+for n in only64[:40]:
+    print(f"[ABI ARM64-ONLY] {n}")
+if len(only64) > 40:
+    print(f"[ABI ARM64-ONLY] ... and {len(only64) - 40} more")
+
+stock_32 = not os.path.isdir(os.path.join(B, "lib64"))
+if stock_32 and only64:
+    print(
+        "::warning::stock userspace is 32-bit, donor has "
+        f"{len(only64)} apps with arm64-only native libs: they will not run on a 32-bit runtime"
+    )
+PY
+
+# ---------- 3. MTK framework / IMS import ----------
+
+section "3. IMPORT MTK FRAMEWORK AND IMS FILES"
+
+# Stock system -> donor system, stock product -> donor system/product.
 # Vendor binaries are NOT copied: stock vendor is retained.
-#
-# This intentionally does not copy every file containing "radio"
-# or "telephony". Only explicit MTK/MediaTek/IMS paths are selected.
 
 python3 - "$B" "$S" "$BP" "$PS" <<'PY'
 import os
@@ -134,20 +325,16 @@ import shutil
 
 pairs = [
     (sys.argv[1], sys.argv[2], "stock-system -> donor-system"),
-    (sys.argv[3], sys.argv[4], "stock-product -> donor-product"),
+    (sys.argv[3], sys.argv[4], "stock-product -> donor-system/product"),
 ]
 
-pattern = re.compile(
-    r"(mediatek|mtk|ims)",
-    re.IGNORECASE
-)
+pattern = re.compile(r"(mediatek|mtk|ims)", re.IGNORECASE)
 
 allowed = {
     ".apk", ".jar", ".so", ".xml", ".rc",
     ".prop", ".conf", ".cfg", ".json"
 }
 
-# Only import files from framework/configuration locations.
 allowed_roots = (
     "app/",
     "priv-app/",
@@ -178,10 +365,7 @@ for src, dst, label in pairs:
     copied = 0
 
     for current, dirs, files in os.walk(src):
-        dirs[:] = [
-            d for d in dirs
-            if not os.path.islink(os.path.join(current, d))
-        ]
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(current, d))]
 
         for filename in files:
             source = os.path.join(current, filename)
@@ -212,269 +396,176 @@ for src, dst, label in pairs:
     print(f"[MTK RESULT] copied={copied}")
 PY
 
-# ---------- 3. stock device features ----------
+# ---------- 4. stock device features ----------
 
-section "3. DEVICE FEATURES"
+section "4. DEVICE FEATURES"
 
 if [ -d "$B/etc/device_features" ]; then
   rm -rf "$S/etc/device_features"
   mkdir -p "$S/etc"
-
   cp -a "$B/etc/device_features" "$S/etc/device_features"
-
   echo "[OK] Stock device_features imported"
 else
   echo "[SKIP] No stock device_features"
 fi
 
-# ---------- 4. stock VINTF compatibility ----------
+# ---------- 5. VINTF ----------
 
-section "4. VINTF ADAPTATION"
+section "5. VINTF: STOCK MATRICES, ALL HALS OPTIONAL"
 
-# Framework compatibility matrices describe what the framework
-# expects from vendor. Stock 9C matrix is a better starting point
-# for the retained stock MTK vendor than the donor's Qualcomm matrix.
-#
-# Do not replace the complete system/etc/vintf directory:
-# donor framework manifest and unrelated MIUI configuration stay.
+# Framework compatibility matrices of the stock 9C replace the donor ones,
+# then every <hal> in them gets optional="true", so a HAL that is not
+# present on this device does not fail the compatibility check.
+# The vendor VINTF manifest is not touched.
 
 if [ -d "$B/etc/vintf" ]; then
   mkdir -p "$S/etc/vintf"
-
   shopt -s nullglob
-
-  MATRIX_FILES=(
-    "$B"/etc/vintf/compatibility_matrix*.xml
-  )
-
-  if [ "${#MATRIX_FILES[@]}" -gt 0 ]; then
-    for f in "${MATRIX_FILES[@]}"; do
-      [ -f "$f" ] || continue
-      cp -a "$f" "$S/etc/vintf/"
-      echo "[VINTF] Stock framework matrix imported: $(basename "$f")"
-    done
-  else
-    echo "[VINTF] No stock system compatibility matrix found"
-  fi
-
+  for f in "$B"/etc/vintf/compatibility_matrix*.xml; do
+    [ -f "$f" ] || continue
+    cp -a "$f" "$S/etc/vintf/"
+    echo "[VINTF] Stock framework matrix imported: $(basename "$f")"
+  done
   shopt -u nullglob
 else
   echo "[VINTF] Stock system has no etc/vintf"
 fi
 
-# Product VINTF is device/product-specific.
-# If stock product exists, replace donor product VINTF with stock
-# product VINTF. This does not touch vendor VINTF.
+python3 - "$S" <<'PY'
+import glob
+import os
+import sys
+import xml.etree.ElementTree as ET
 
-if available "$BP" && available "$PS"; then
-  if [ -d "$BP/etc/vintf" ]; then
-    rm -rf "$PS/etc/vintf"
-    mkdir -p "$PS/etc"
-    cp -a "$BP/etc/vintf" "$PS/etc/vintf"
-    echo "[VINTF] Stock product VINTF imported"
-  else
-    echo "[VINTF] Stock product has no etc/vintf"
-  fi
-else
-  echo "[VINTF] Product VINTF import skipped: product unavailable"
-fi
+S = sys.argv[1]
 
-# ---------- 5. stock device init configuration ----------
+files = sorted(
+    glob.glob(os.path.join(S, "etc/vintf/compatibility_matrix*.xml")) +
+    glob.glob(os.path.join(S, "product/etc/vintf/compatibility_matrix*.xml"))
+)
 
-section "5. MTK INIT CONFIGURATION"
+if not files:
+    print("[VINTF] no compatibility matrices found")
 
-# Import only explicitly MTK/IMS-related init files.
-# Do not copy all stock init scripts over donor platform init.
+total = 0
 
-python3 - "$B" "$S" "$BP" "$PS" <<'PY'
+for path in files:
+    try:
+        tree = ET.parse(path)
+    except Exception as e:
+        print(f"[WARNING] cannot parse {path}: {e}")
+        continue
+
+    changed = 0
+    for hal in tree.getroot().iter("hal"):
+        if hal.get("optional") != "true":
+            hal.set("optional", "true")
+            changed += 1
+
+    if changed:
+        tree.write(path, encoding="utf-8", xml_declaration=True)
+        total += changed
+
+    print(f"[VINTF] {os.path.relpath(path, S)}: {changed} hal(s) set optional=true")
+
+print(f"[VINTF] total hal entries made optional: {total}")
+PY
+
+# ---------- 6. MTK init import ----------
+
+section "6. MTK INIT CONFIGURATION"
+
+python3 - "$B" "$S" <<'PY'
 import os
 import re
 import sys
 import shutil
 
-pairs = [
-    (sys.argv[1], sys.argv[2], "system"),
-    (sys.argv[3], sys.argv[4], "product"),
-]
+src, dst = sys.argv[1], sys.argv[2]
 
 pattern = re.compile(r"(mediatek|mtk|ims)", re.IGNORECASE)
 
-for src, dst, label in pairs:
-    print(f"\n[INIT IMPORT] {label}")
+count = 0
 
-    if not src or not dst or not os.path.isdir(src) or not os.path.isdir(dst):
-        print("[SKIP] unavailable")
-        continue
+for current, dirs, files in os.walk(src):
+    dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(current, d))]
 
-    count = 0
+    for name in files:
+        if not name.endswith(".rc"):
+            continue
 
-    for current, dirs, files in os.walk(src):
-        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(current, d))]
+        source = os.path.join(current, name)
+        if os.path.islink(source):
+            continue
 
-        for name in files:
-            if not name.endswith(".rc"):
-                continue
+        rel = os.path.relpath(source, src).replace("\\", "/")
 
-            source = os.path.join(current, name)
-            if os.path.islink(source):
-                continue
+        if not rel.startswith("etc/init/") or not pattern.search(rel):
+            continue
 
-            rel = os.path.relpath(source, src).replace("\\", "/")
+        target = os.path.join(dst, rel)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copy2(source, target)
+        print(f"[INIT COPY] {rel}")
+        count += 1
 
-            if not rel.startswith("etc/init/"):
-                continue
-
-            if not pattern.search(rel):
-                continue
-
-            target = os.path.join(dst, rel)
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            shutil.copy2(source, target)
-
-            print(f"[INIT COPY] {rel}")
-            count += 1
-
-    print(f"[INIT RESULT] copied={count}")
+print(f"[INIT RESULT] copied={count}")
 PY
 
-# ---------- 6. conservative Qualcomm cleanup ----------
+# ---------- 7. soft Qualcomm cleanup ----------
 
-section "6. QUALCOMM COMPONENT CLEANUP"
+section "7. QUALCOMM COMPONENTS (SOFT CLEANUP, NO LIBRARIES)"
 
-# Deliberately conservative:
-#
-# Removed:
-#   - clearly Qualcomm-named files/directories
-#   - QTI / Qualcomm packages and libraries
-#   - Qualcomm-specific init scripts
-#
-# Preserved:
-#   - generic IMS/RIL/radio libraries
-#   - generic Android telephony framework
-#   - files without clear Qualcomm identification
-#   - stock vendor partition
-#
-# Names of removed libraries are written to $REMOVED_LIST,
-# the dependency cascade (section 12b) uses them.
+# Only applications that are useless on MediaTek are removed.
+# Libraries, jars and permission files are left in place on purpose:
+# removing them broke dependencies (see dependency audit in older logs).
+# More paths can be added through patches/remove.txt.
 
-python3 - "$S" "$PS" <<'PY'
-import os
-import re
-import sys
-import shutil
-
-roots = [
-    ("donor-system", sys.argv[1]),
-    ("donor-product", sys.argv[2]),
-]
-
-qcom = re.compile(
-    r"("
-    r"qualcomm|"
-    r"com\.qualcomm|"
-    r"com\.qti|"
-    r"vendor\.qti|"
-    r"vendor\.qcom|"
-    r"libqti|"
-    r"libqcril|"
-    r"libqmi|"
-    r"qcril|"
-    r"qsee|"
-    r"qtee|"
-    r"qdsp|"
-    r"qcom"
-    r")",
-    re.IGNORECASE
+DEFAULT_REMOVE=(
+  "product/app/QtiSystemService"
+  "product/app/QtiTelephonyService"
+  "app/QTIDiagServices"
 )
 
-removed_names = []
+for p in "${DEFAULT_REMOVE[@]}"; do
+  if echo "$p" | grep -Eqi "$KEEP_RE"; then
+    echo "[KEEP] $p"
+    continue
+  fi
+  if [ -e "$S/$p" ] || [ -L "$S/$p" ]; then
+    rm -rf -- "${S:?}/$p"
+    echo "[SOFT REMOVE] $p"
+  else
+    echo "[SOFT NOT FOUND] $p"
+  fi
+done
 
+# ---------- 8. init cleanup ----------
 
-def is_lib(name):
-    return name.endswith(".so") or ".so." in name
-
-
-def record_dir_libs(path):
-    for cur, dirs, files in os.walk(path):
-        for n in files:
-            if is_lib(n):
-                removed_names.append(n)
-
-
-for label, root in roots:
-    print(f"\n[QCOM CLEAN] {label}")
-
-    if not root or not os.path.isdir(root):
-        print("[SKIP] unavailable")
-        continue
-
-    removed = 0
-
-    for current, dirs, files in os.walk(root, topdown=True):
-        rel_current = os.path.relpath(current, root).replace("\\", "/")
-
-        kept_dirs = []
-
-        for d in dirs:
-            path = os.path.join(current, d)
-            rel = os.path.join(rel_current, d).replace("\\", "/")
-
-            if qcom.search(rel):
-                print(f"[QCOM REMOVE DIR] {rel}")
-                record_dir_libs(path)
-                shutil.rmtree(path, ignore_errors=True)
-                removed += 1
-            else:
-                kept_dirs.append(d)
-
-        dirs[:] = kept_dirs
-
-        for name in files:
-            path = os.path.join(current, name)
-            rel = os.path.relpath(path, root).replace("\\", "/")
-
-            if qcom.search(rel):
-                try:
-                    os.remove(path)
-                    print(f"[QCOM REMOVE FILE] {rel}")
-                    removed += 1
-                    if is_lib(name):
-                        removed_names.append(name)
-                except OSError as e:
-                    print(f"[WARNING] cannot remove {rel}: {e}")
-
-    print(f"[QCOM RESULT] removed={removed}")
-
-lst = os.environ.get("REMOVED_LIST")
-if lst:
-    with open(lst, "a", encoding="utf-8") as f:
-        for n in sorted(set(removed_names)):
-            f.write(n + "\n")
-    print(f"\n[QCOM] removed library names recorded: {len(set(removed_names))}")
-PY
-
-# ---------- 7. remove Qualcomm init service blocks ----------
-
-section "7. QUALCOMM INIT SERVICE CLEANUP"
+section "8. QUALCOMM INIT CLEANUP"
 
 # service / import blocks that mention Qualcomm are removed whole.
-# "on" action blocks: only the offending lines are removed, so other
-# commands in the same block are kept (unless the trigger itself is Qualcomm).
+# "on" action blocks: only the offending lines are removed.
+# Anything matching KEEP_RE is kept.
 
-python3 - "$S" "$PS" <<'PY'
+python3 - "$S" <<'PY'
 import os
 import re
 import sys
 
-roots = [
-    ("donor-system", sys.argv[1]),
-    ("donor-product", sys.argv[2]),
-]
+S = sys.argv[1]
+
+keep = re.compile(os.environ.get("KEEP_RE") or r"(?!)", re.IGNORECASE)
 
 qcom = re.compile(
     r"(qualcomm|com\.qti|com\.qualcomm|vendor\.qti|vendor\.qcom|qcril|qsee|qtee|qdsp|qcom)",
     re.IGNORECASE
 )
+
+
+def hit(text):
+    return bool(qcom.search(text)) and not keep.search(text)
+
 
 HEADERS = ("service ", "on ", "import ")
 
@@ -496,17 +587,17 @@ def clean_rc(path):
         if not block:
             return
 
-        if kind == "action" and not qcom.search(block[0]):
+        if kind == "action" and not hit(block[0]):
             kept = [block[0]]
             for x in block[1:]:
                 s = x.strip()
-                if s and not s.startswith("#") and qcom.search(x):
+                if s and not s.startswith("#") and hit(x):
                     changed = True
                     print(f"[INIT REMOVE LINE] {path}: {s}")
                 else:
                     kept.append(x)
             out.extend(kept)
-        elif any(qcom.search(x) for x in block):
+        elif any(hit(x) for x in block):
             changed = True
             print(f"[INIT REMOVE {kind.upper()}] {path}: {block[0].strip()}")
         else:
@@ -540,235 +631,20 @@ def clean_rc(path):
             f.writelines(out)
 
 
-for label, root in roots:
-    print(f"\n[INIT CLEAN] {label}")
-
-    if not root or not os.path.isdir(root):
-        print("[SKIP] unavailable")
-        continue
-
-    for current, dirs, files in os.walk(root):
-        for name in files:
-            if name.endswith(".rc"):
-                clean_rc(os.path.join(current, name))
+for current, dirs, files in os.walk(S):
+    for name in files:
+        if name.endswith(".rc"):
+            clean_rc(os.path.join(current, name))
 PY
 
-# ---------- 8. XML registration cleanup ----------
+# ---------- 9. remove lists ----------
 
-section "8. XML REGISTRATION CLEANUP"
-
-# Remove Qualcomm-specific XML nodes, especially:
-#   - VINTF HAL declarations
-#   - shared library registrations
-#   - Qualcomm permissions/features
-#
-# Generic IMS entries are preserved unless their actual XML node
-# explicitly references Qualcomm/QTI.
-
-python3 - "$S" "$PS" <<'PY'
-import os
-import re
-import sys
-import xml.etree.ElementTree as ET
-
-roots = [
-    ("donor-system", sys.argv[1]),
-    ("donor-product", sys.argv[2]),
-]
-
-qcom = re.compile(
-    r"(qualcomm|com\.qti|com\.qualcomm|vendor\.qti|vendor\.qcom|libqti|libqcril|qcril|qsee|qtee|qdsp|qcom)",
-    re.IGNORECASE
-)
-
-removable_tags = {
-    "hal",
-    "library",
-    "feature",
-    "permission",
-    "assign-permission",
-    "privapp-permissions",
-    "uses-library",
-    "interface",
-}
-
-for label, root in roots:
-    print(f"\n[XML CLEAN] {label}")
-
-    if not root or not os.path.isdir(root):
-        print("[SKIP] unavailable")
-        continue
-
-    for current, dirs, files in os.walk(root):
-        for name in files:
-            if not name.endswith(".xml"):
-                continue
-
-            path = os.path.join(current, name)
-
-            try:
-                tree = ET.parse(path)
-                document = tree.getroot()
-            except Exception:
-                continue
-
-            parents = {
-                child: parent
-                for parent in document.iter()
-                for child in parent
-            }
-
-            removed = 0
-
-            for node in reversed(list(document.iter())):
-                parent = parents.get(node)
-                if parent is None:
-                    continue
-
-                tag = node.tag.split("}")[-1]
-
-                if tag not in removable_tags:
-                    continue
-
-                content = " ".join(
-                    [str(x) for x in node.attrib.values()] +
-                    [node.text or ""] +
-                    [
-                        child.text or ""
-                        for child in node.iter()
-                        if child is not node
-                    ]
-                )
-
-                if qcom.search(content):
-                    parent.remove(node)
-                    removed += 1
-
-            if removed:
-                try:
-                    tree.write(
-                        path,
-                        encoding="utf-8",
-                        xml_declaration=True
-                    )
-                    print(f"[XML PRUNED] {path}: {removed} nodes")
-                except Exception as e:
-                    print(f"[WARNING] XML write failed: {path}: {e}")
-PY
-
-# ---------- 9. public library registration cleanup ----------
-
-section "9. LINKER PUBLIC LIBRARY REGISTRATIONS"
-
-# Remove explicit Qualcomm lines from public library lists.
-# Do not rewrite generic linker configuration files.
-
-python3 - "$S" "$PS" <<'PY'
-import os
-import re
-import sys
-
-roots = [sys.argv[1], sys.argv[2]]
-
-qcom = re.compile(
-    r"(qualcomm|com\.qti|com\.qualcomm|vendor\.qti|vendor\.qcom|libqti|libqcril|qcril|qcom)",
-    re.IGNORECASE
-)
-
-for root in roots:
-    if not root or not os.path.isdir(root):
-        continue
-
-    for current, dirs, files in os.walk(root):
-        for name in files:
-            if not name.startswith("public.libraries"):
-                continue
-
-            path = os.path.join(current, name)
-
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    lines = f.readlines()
-            except OSError:
-                continue
-
-            kept = [line for line in lines if not qcom.search(line)]
-
-            if len(kept) != len(lines):
-                with open(path, "w", encoding="utf-8") as f:
-                    f.writelines(kept)
-
-                print(
-                    f"[LINKER REGISTRATION] {path}: "
-                    f"removed {len(lines) - len(kept)} entries"
-                )
-PY
-
-# ---------- 10. fstab ----------
-
-section "10. FSTAB"
-
-# fstab is commonly located in the boot ramdisk on Android.
-# This patcher does NOT unpack or modify boot.img.
-#
-# If stock system/product contains fstab files, copy them into
-# the corresponding donor partition locations for inspection/use.
-
-python3 - "$B" "$S" "$BP" "$PS" <<'PY'
-import os
-import sys
-import shutil
-
-pairs = [
-    (sys.argv[1], sys.argv[2], "system"),
-    (sys.argv[3], sys.argv[4], "product"),
-]
-
-for src, dst, label in pairs:
-    print(f"\n[FSTAB] {label}")
-
-    if not src or not dst or not os.path.isdir(src) or not os.path.isdir(dst):
-        print("[SKIP] unavailable")
-        continue
-
-    count = 0
-
-    for current, dirs, files in os.walk(src):
-        for name in files:
-            lower = name.lower()
-
-            if not (lower.startswith("fstab") or "fstab" in lower):
-                continue
-
-            source = os.path.join(current, name)
-            if os.path.islink(source):
-                continue
-
-            rel = os.path.relpath(source, src)
-            target = os.path.join(dst, rel)
-
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            shutil.copy2(source, target)
-
-            print(f"[FSTAB COPY] {rel}")
-            count += 1
-
-    print(f"[FSTAB RESULT] copied={count}")
-PY
-
-# ---------- 11. remove lists ----------
-
-section "11. REMOVE LISTS"
+section "9. REMOVE LIST (patches/remove.txt, paths relative to system)"
 
 apply_remove_list() {
   local root="$1"
   local file="$2"
   local label="$3"
-
-  if [ -z "$root" ] || [ ! -d "$root" ]; then
-    echo "[SKIP] $label root unavailable"
-    return
-  fi
 
   if [ ! -f "$file" ]; then
     echo "[SKIP] $file not found"
@@ -789,6 +665,11 @@ apply_remove_list() {
       continue
     fi
 
+    if echo "$p" | grep -Eqi "$KEEP_RE"; then
+      echo "[$label KEEP] $p (matches keep list)"
+      continue
+    fi
+
     target="$root/$p"
 
     if [ -e "$target" ] || [ -L "$target" ]; then
@@ -801,11 +682,10 @@ apply_remove_list() {
 }
 
 apply_remove_list "$S" "$REPO/patches/remove.txt" "SYSTEM"
-apply_remove_list "$PS" "$REPO/patches/product-remove.txt" "PRODUCT"
 
-# ---------- 12. overlays ----------
+# ---------- 10. overlays ----------
 
-section "12. OVERLAYS"
+section "10. OVERLAYS"
 
 if [ -d "$REPO/patches/overlay" ]; then
   cp -a "$REPO/patches/overlay/." "$S/"
@@ -814,37 +694,26 @@ else
   echo "[SKIP] no system overlay"
 fi
 
-if [ -n "$PS" ] && [ -d "$REPO/patches/product-overlay" ]; then
-  mkdir -p "$PS"
-  cp -a "$REPO/patches/product-overlay/." "$PS/"
-  echo "[OK] product overlay applied"
-else
-  echo "[SKIP] no product overlay"
-fi
+# ---------- 11. missing dependency resolver ----------
 
-# ---------- 12b. dependency cascade ----------
+section "11. MISSING LIBRARY RESOLVER (ADD FROM STOCK, NOTHING IS DELETED)"
 
-section "12b. DEPENDENCY CASCADE"
+# For every ELF in the donor that needs a library which exists neither in
+# donor system nor in stock vendor: if the stock system has it (same ELF
+# class, 32/64 bit), copy it to the same path. Repeats until nothing new
+# is added. What stock does not have is reported.
 
-# For every ELF that still needs a library that was removed (or has a
-# Qualcomm name and does not exist anywhere):
-#   - optional Qualcomm/IMS-only component  -> removed, then its own
-#     dependents are checked in the next pass
-#   - required component (for example bin/keystore) -> replaced with the
-#     stock 9C file, if stock has it
-#   - otherwise -> reported as UNRESOLVED, nothing is deleted
-
-python3 - "$S" "$B" "$PS" "$BP" "$BV" "$REMOVED_LIST" <<'PY'
+python3 - "$S" "$B" "$BV" <<'PY'
 import os
 import re
 import shutil
 import subprocess
 import sys
 
-S, B, PS, BP, BV, LIST = sys.argv[1:7]
+S, B, BV = sys.argv[1:4]
 
 if shutil.which("readelf") is None:
-    print("[CASCADE] readelf not found, skipped")
+    print("[RESOLVE] readelf not found, skipped")
     sys.exit(0)
 
 qcom = re.compile(
@@ -852,19 +721,20 @@ qcom = re.compile(
     re.IGNORECASE,
 )
 
-# components that may be deleted when they lose a dependency
-OPTIONAL = re.compile(
-    r"(qti|qcom|qualcomm|sigma|miracast|lib-ims|imsrtp|imscm|imsvt|imssettings|"
-    r"imscamera|imsmedia|secureui|uceservice|uceshim|rcsconfig|wigig|cne|dpm|"
-    r"embms|uimservice|uimremote|soter|wifikeystore|tui_comm)",
-    re.IGNORECASE,
-)
-
-stage_roots = [(r, b) for r, b in ((S, B), (PS, BP)) if r and os.path.isdir(r)]
-
 
 def is_lib(name):
     return name.endswith(".so") or ".so." in name
+
+
+def elf_class(path):
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(5)
+        if len(head) == 5 and head[:4] == b"\x7fELF":
+            return head[4]
+    except OSError:
+        pass
+    return 0
 
 
 def so_names(roots):
@@ -885,113 +755,124 @@ def needed(path):
     if path in needs_cache:
         return needs_cache[path]
     res = None
-    try:
-        with open(path, "rb") as fh:
-            if fh.read(4) == b"\x7fELF":
-                out = subprocess.run(
-                    ["readelf", "-d", path], capture_output=True, text=True
-                ).stdout
-                res = re.findall(r"Shared library: \[([^\]]+)\]", out)
-    except OSError:
-        pass
+    if elf_class(path):
+        out = subprocess.run(
+            ["readelf", "-d", path], capture_output=True, text=True
+        ).stdout
+        res = re.findall(r"Shared library: \[([^\]]+)\]", out)
     needs_cache[path] = res
     return res
 
 
-removed = set()
-if LIST and os.path.isfile(LIST):
-    with open(LIST, encoding="utf-8") as f:
-        removed.update(x.strip() for x in f if x.strip())
+# index of the stock system libraries: name -> [(rel, elf class)]
+stock_idx = {}
+for cur, dirs, files in os.walk(B):
+    for n in files:
+        if not is_lib(n):
+            continue
+        p = os.path.join(cur, n)
+        if os.path.islink(p):
+            continue
+        cls = elf_class(p)
+        if cls:
+            rel = os.path.relpath(p, B).replace("\\", "/")
+            stock_idx.setdefault(n, []).append((rel, cls))
 
-print(f"[CASCADE] start: {len(removed)} removed library names known")
 
-restored = set()
-unresolved = {}
-deleted = 0
+def pick(name, cls):
+    cands = [c for c in stock_idx.get(name, []) if c[1] == cls]
+    if not cands:
+        return None
+    cands.sort(key=lambda c: (not c[0].startswith(("lib/", "lib64/")), len(c[0])))
+    return cands[0][0]
 
-for pass_no in range(1, 9):
-    have = so_names([S, PS, BV])
-    hits = []
 
-    for root, base in stage_roots:
-        for cur, dirs, files in os.walk(root):
-            for name in files:
-                path = os.path.join(cur, name)
-                if os.path.islink(path):
-                    continue
-                needs = needed(path)
-                if not needs:
-                    continue
-                bad = [
-                    n for n in needs
-                    if n not in have and (n in removed or qcom.search(n))
-                ]
-                if bad:
-                    hits.append((root, base, path, bad))
+added = []
+
+for pass_no in range(1, 7):
+    have = so_names([S, BV])
+    missing = {}
+
+    for cur, dirs, files in os.walk(S):
+        for name in files:
+            path = os.path.join(cur, name)
+            if os.path.islink(path):
+                continue
+            needs = needed(path)
+            if not needs:
+                continue
+            cls = elf_class(path)
+            for n in needs:
+                if n not in have:
+                    missing.setdefault((n, cls), []).append(
+                        os.path.relpath(path, S).replace("\\", "/")
+                    )
 
     changed = False
 
-    for root, base, path, bad in hits:
-        rel = os.path.relpath(path, root).replace("\\", "/")
-        key = (root, rel)
-        name = os.path.basename(path)
-        stock = os.path.join(base, rel)
-
-        if OPTIONAL.search(rel):
-            try:
-                os.remove(path)
-            except OSError as e:
-                print(f"[WARNING] cannot remove {rel}: {e}")
-                continue
-            needs_cache.pop(path, None)
-            print(f"[CASCADE REMOVE] pass {pass_no}: {rel} (needs {', '.join(bad)})")
-            if is_lib(name):
-                removed.add(name)
-            unresolved.pop(key, None)
-            deleted += 1
-            changed = True
-
-        elif key not in restored and os.path.isfile(stock) and not os.path.islink(stock):
-            shutil.copy2(stock, path)
-            st = os.stat(stock)
-            os.chown(path, st.st_uid, st.st_gid)
-            needs_cache.pop(path, None)
-            restored.add(key)
-            print(
-                f"[CASCADE RESTORE] pass {pass_no}: {rel} <- stock "
-                f"(donor file needed {', '.join(bad)})"
-            )
-            changed = True
-
-        else:
-            if key not in unresolved:
-                print(f"[CASCADE UNRESOLVED] {rel} needs {', '.join(bad)}")
-            unresolved[key] = bad
+    for (n, cls), users in sorted(missing.items()):
+        rel = pick(n, cls)
+        if not rel:
+            continue
+        dst = os.path.join(S, rel)
+        if os.path.lexists(dst):
+            continue
+        src = os.path.join(B, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        st = os.stat(src)
+        os.chown(dst, st.st_uid, st.st_gid)
+        needs_cache.pop(dst, None)
+        added.append(rel)
+        print(f"[RESOLVE ADD] pass {pass_no}: {rel} <- stock (needed by {', '.join(users[:3])})")
+        changed = True
 
     if not changed:
         break
 
-print(f"\n[CASCADE] done: removed={deleted} restored={len(restored)} unresolved={len(unresolved)}")
+print(f"\n[RESOLVE] libraries added from stock: {len(added)}")
 
-for (root, rel), bad in sorted(unresolved.items(), key=lambda x: x[0][1]):
-    print(f"::warning::cascade unresolved: {rel} needs {', '.join(bad)}")
+# final report
+have = so_names([S, BV])
+final = {}
+for cur, dirs, files in os.walk(S):
+    for name in files:
+        path = os.path.join(cur, name)
+        if os.path.islink(path):
+            continue
+        needs = needed(path)
+        if not needs:
+            continue
+        for n in needs:
+            if n not in have:
+                final.setdefault(n, []).append(os.path.relpath(path, S).replace("\\", "/"))
+
+print(f"[RESOLVE] libraries still missing: {len(final)}")
+
+items = sorted(final.items(), key=lambda kv: (not qcom.search(kv[0]), -len(kv[1]), kv[0]))
+for n, users in items[:80]:
+    tag = "MISSING QTI" if qcom.search(n) else "MISSING DEP"
+    shown = ", ".join(users[:4])
+    more = f" (+{len(users) - 4} more)" if len(users) > 4 else ""
+    print(f"[{tag}] {n} <- {shown}{more}")
+if len(items) > 80:
+    print(f"[MISSING DEP] ... and {len(items) - 80} more libraries")
 PY
 
-# ---------- 12c. dangling references ----------
+# ---------- 12. dangling references ----------
 
-section "12c. DANGLING REFERENCES (INIT SERVICES, PERMISSION LIBRARIES)"
+section "12. DANGLING REFERENCES (INIT SERVICES, PERMISSION LIBRARIES)"
 
-# init services whose binary no longer exists, and <library file="..."/>
-# entries in permission XML whose file no longer exists.
-# Only /system and /product paths are checked, other locations are left alone.
+# init services whose binary does not exist and <library file="..."/> entries
+# in permission XML whose file does not exist. Only /system and /product
+# paths are checked, other locations are left alone.
 
-python3 - "$S" "$PS" <<'PY'
+python3 - "$S" <<'PY'
 import os
 import sys
 import xml.etree.ElementTree as ET
 
 S = sys.argv[1].rstrip("/")
-PS = sys.argv[2].rstrip("/") if sys.argv[2] else ""
 
 root_dir = os.path.dirname(S) if os.path.basename(S) == "system" else None
 
@@ -1000,10 +881,7 @@ def present(devpath):
     if devpath.startswith("/system/"):
         return os.path.lexists(os.path.join(S, devpath[len("/system/"):]))
     if devpath.startswith("/product/"):
-        rel = devpath[len("/product/"):]
-        if PS and os.path.lexists(os.path.join(PS, rel)):
-            return True
-        return os.path.lexists(os.path.join(S, "product", rel))
+        return os.path.lexists(os.path.join(S, "product", devpath[len("/product/"):]))
     return True
 
 
@@ -1064,14 +942,10 @@ def clean_rc(path):
 
 total_services = 0
 
-scan_roots = [S] + ([PS] if PS else [])
-for root in scan_roots:
-    if not os.path.isdir(root):
-        continue
-    for cur, dirs, files in os.walk(root):
-        for name in files:
-            if name.endswith(".rc"):
-                total_services += clean_rc(os.path.join(cur, name))
+for cur, dirs, files in os.walk(S):
+    for name in files:
+        if name.endswith(".rc"):
+            total_services += clean_rc(os.path.join(cur, name))
 
 if root_dir and os.path.isdir(root_dir):
     for name in os.listdir(root_dir):
@@ -1083,193 +957,75 @@ print(f"[DANGLING] init services removed: {total_services}")
 
 total_libs = 0
 
-for root in scan_roots:
-    if not os.path.isdir(root):
+for cur, dirs, files in os.walk(S):
+    if os.path.basename(cur) != "permissions":
         continue
-    for cur, dirs, files in os.walk(root):
-        if os.path.basename(cur) != "permissions":
+    for name in files:
+        if not name.endswith(".xml"):
             continue
-        for name in files:
-            if not name.endswith(".xml"):
+        path = os.path.join(cur, name)
+        try:
+            tree = ET.parse(path)
+            document = tree.getroot()
+        except Exception:
+            continue
+
+        parents = {c: p for p in document.iter() for c in p}
+        removed = 0
+
+        for node in list(document.iter()):
+            if node.tag.split("}")[-1] != "library":
                 continue
-            path = os.path.join(cur, name)
+            f = node.attrib.get("file", "")
+            if f.startswith(("/system/", "/product/")) and not present(f):
+                parent = parents.get(node)
+                if parent is not None:
+                    parent.remove(node)
+                    removed += 1
+                    print(f"[DANGLING LIBRARY] {path}: {f}")
+
+        if removed:
             try:
-                tree = ET.parse(path)
-                document = tree.getroot()
-            except Exception:
-                continue
-
-            parents = {c: p for p in document.iter() for c in p}
-            removed = 0
-
-            for node in list(document.iter()):
-                if node.tag.split("}")[-1] != "library":
-                    continue
-                f = node.attrib.get("file", "")
-                if f.startswith(("/system/", "/product/")) and not present(f):
-                    parent = parents.get(node)
-                    if parent is not None:
-                        parent.remove(node)
-                        removed += 1
-                        print(f"[DANGLING LIBRARY] {path}: {f}")
-
-            if removed:
-                try:
-                    tree.write(path, encoding="utf-8", xml_declaration=True)
-                    total_libs += removed
-                except Exception as e:
-                    print(f"[WARNING] XML write failed: {path}: {e}")
+                tree.write(path, encoding="utf-8", xml_declaration=True)
+                total_libs += removed
+            except Exception as e:
+                print(f"[WARNING] XML write failed: {path}: {e}")
 
 print(f"[DANGLING] permission library entries removed: {total_libs}")
 PY
 
-# ---------- 12d. ELF dependency audit (report only) ----------
+# ---------- 13. inventory ----------
 
-section "12d. ELF DEPENDENCY AUDIT"
+section "13. HARDWARE-RELATED FILES LEFT IN SYSTEM (first 120)"
 
-# Final report, nothing is changed here.
-#   [BROKEN DEP]  needed library has a Qualcomm name and is missing
-#   [MISSING DEP] any other needed library that is not found in
-#                 donor system/product or stock vendor (first 40 shown)
-# A missing DT_NEEDED library can stop a native service or system_server.
-
-python3 - "$S" "$PS" "$BV" <<'PY'
-import os
-import re
-import shutil
-import subprocess
-import sys
-
-if shutil.which("readelf") is None:
-    print("[ELF AUDIT] readelf not found, audit skipped")
-    sys.exit(0)
-
-qcom = re.compile(
-    r"(qualcomm|com\.qti|vendor\.qti|vendor\.qcom|libqti|libqcril|libqmi|qcril|qsee|qtee|qdsp|qcom)",
-    re.IGNORECASE
-)
-
-stage_roots = [r for r in sys.argv[1:3] if r and os.path.isdir(r)]
-have_roots = [r for r in sys.argv[1:4] if r and os.path.isdir(r)]
-
-have = set()
-for root in have_roots:
-    for current, dirs, files in os.walk(root):
-        for name in files:
-            if name.endswith(".so") or ".so." in name:
-                have.add(name)
-
-broken = {}
-other = {}
-
-for root in stage_roots:
-    for current, dirs, files in os.walk(root):
-        for name in files:
-            path = os.path.join(current, name)
-
-            if os.path.islink(path):
-                continue
-
-            try:
-                with open(path, "rb") as fh:
-                    if fh.read(4) != b"\x7fELF":
-                        continue
-            except OSError:
-                continue
-
-            out = subprocess.run(
-                ["readelf", "-d", path],
-                capture_output=True,
-                text=True
-            ).stdout
-
-            for m in re.finditer(r"Shared library: \[([^\]]+)\]", out):
-                need = m.group(1)
-                if need in have:
-                    continue
-                rel = os.path.relpath(path, root).replace("\\", "/")
-                if qcom.search(need):
-                    broken.setdefault(need, []).append(rel)
-                else:
-                    other.setdefault(need, []).append(rel)
-
-
-def show(tag, table, limit):
-    items = sorted(table.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-    for need, users in items[:limit]:
-        shown = ", ".join(users[:4])
-        more = f" (+{len(users) - 4} more)" if len(users) > 4 else ""
-        print(f"[{tag}] {need} <- {shown}{more}")
-    if len(items) > limit:
-        print(f"[{tag}] ... and {len(items) - limit} more libraries")
-
-
-print(f"[ELF AUDIT] missing Qualcomm libraries still referenced: {len(broken)}")
-show("BROKEN DEP", broken, 200)
-
-print(f"[ELF AUDIT] other missing libraries: {len(other)}")
-show("MISSING DEP", other, 40)
-
-if not broken:
-    print("[ELF AUDIT] OK: no broken Qualcomm dependencies found")
-PY
-
-# ---------- 13. final inventory ----------
-
-section "13. FINAL INVENTORY"
-
-for pair in \
-  "SYSTEM:$S" \
-  "PRODUCT:$PS"
-do
-  label="${pair%%:*}"
-  root="${pair#*:}"
-
-  [ -n "$root" ] && [ -d "$root" ] || continue
-
-  echo
-  echo "--- $label hardware-related files ---"
-
-  find "$root" \
-    \( \
-      -iname '*mtk*' -o \
-      -iname '*mediatek*' -o \
-      -iname '*ims*' -o \
-      -iname '*ril*' -o \
-      -iname '*qcom*' -o \
-      -iname '*qualcomm*' -o \
-      -iname '*qti*' \
-    \) \
-    -print 2>/dev/null | head -300 || true
-done
+find "$S" \
+  \( \
+    -iname '*qcom*' -o \
+    -iname '*qualcomm*' -o \
+    -iname '*qti*' \
+  \) \
+  -print 2>/dev/null | head -120 || true
 
 section "14. PATCH SUMMARY"
 
 echo "Stock system : $B"
 echo "Donor system : $S"
-echo "Stock product: ${BP:-unavailable}"
-echo "Donor product: ${DP:-unavailable}"
-echo "Stage product: ${PS:-unavailable}"
+echo "Product      : inside system (no product partition)"
 echo "Stock vendor : ${BV:-unavailable}"
 
 echo
 echo "Applied:"
-echo "  - Device identity"
-echo "  - MTK/IMS framework-side import"
+echo "  - build.prop / prop.default: identity, ABI, zygote, hardcoded hardware values, Qualcomm properties"
+echo "  - ABI report"
+echo "  - MTK/IMS framework-side import from stock"
 echo "  - Stock device_features"
-echo "  - Stock framework compatibility matrices"
-echo "  - Stock product VINTF when available"
+echo "  - Stock framework compatibility matrices, all hal optional=true"
 echo "  - MTK/IMS init import"
-echo "  - Conservative Qualcomm cleanup"
-echo "  - Qualcomm init cleanup (services whole, action blocks by line)"
-echo "  - Qualcomm XML registration cleanup"
-echo "  - Qualcomm public library registration cleanup"
-echo "  - Stock fstab files copied when present"
-echo "  - remove.txt / product-remove.txt"
-echo "  - system/product overlays"
-echo "  - Dependency cascade (remove optional dependents, restore required ones)"
-echo "  - Dangling init services and permission library entries removed"
-echo "  - ELF dependency audit (report only)"
+echo "  - Soft Qualcomm cleanup (apps only) and init cleanup"
+echo "  - Keep list: $KEEP_RE"
+echo "  - patches/remove.txt, patches/overlay"
+echo "  - Missing library resolver (adds from stock, deletes nothing)"
+echo "  - Dangling init services and permission library entries"
 
 echo
 echo "Not modified:"
